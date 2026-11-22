@@ -18,7 +18,7 @@ import { promisify } from "node:util";
 
 import { classifyReasonCode, createDeadLetterQueue } from "../dist/deadLetter.js";
 import {
-  exportDeadLetterBundle,
+  DLQ_EXIT_CODES,
   listDeadLetters,
   parseDurationMs,
   purgeDeadLetters,
@@ -383,71 +383,107 @@ test("parseDurationMs supports ms, s, m, h, d, w and compound durations", () => 
   assert.throws(() => parseDurationMs("abc"), /invalid --older-than/);
 });
 
-// ── bundle subcommand ─────────────────────────────────────────────────────────
+// ── Stable exit codes & machine-readable stdout ───────────────────────────────
 
-test("bundle exports queue metadata and stable reason codes without credentials or destinations", async () => {
-  const RAW_BODY = "PRIVATE-ALERT-PAYLOAD-98765";
-  await withTempDlq(
-    async ({ directory, filePath }) => {
-      const outFile = path.join(directory, "incident-bundle.json");
+test("malformed JSON and invalid schema exit with code 3 and keep stdout empty", async () => {
+  await withTempDlq(async ({ filePath }) => {
+    for (const badBody of ["{not-json", JSON.stringify({ version: 2, entries: [] }), JSON.stringify({ version: 1, entries: [{}] })]) {
+      await writeFile(filePath, badBody, "utf8");
       const io = captureIo();
       const { exitCode } = await runDlqCli({
-        argv: ["bundle", "--file", filePath, "--out", outFile, "--chat-id", RAW_CHAT_ID],
+        argv: ["list", "--file", filePath, "--json"],
         stdout: io.out,
         stderr: io.err,
       });
 
-      assert.equal(exitCode, 0);
-      assert.equal(io.stderr.length, 0);
-      assert.match(io.stdout.join("\n"), /exported incident bundle \(depth=2\)/);
-
-      const bundleRaw = await readFile(outFile, "utf8");
-      assert.equal(bundleRaw.includes(RAW_CHAT_ID), false, "raw chat id must be omitted");
-      assert.equal(bundleRaw.includes(REDACTED_CHAT_ID), false, "chat id must not appear in bundle");
-      assert.equal(bundleRaw.includes(RAW_CHANNEL), false, "channel handle must be omitted");
-      assert.equal(bundleRaw.includes(BOT_TOKEN), false, "bot token must be omitted");
-      assert.equal(bundleRaw.includes(RAW_BODY), false, "raw message body must be omitted");
-
-      const bundle = JSON.parse(bundleRaw);
-      assert.equal(bundle.schemaVersion, 1);
-      assert.equal(bundle.queue.depth, 2);
-      assert.deepEqual(bundle.queue.bySource, { market: 1, squad: 1 });
-      assert.deepEqual(bundle.queue.byReasonCode, {
-        DLQ_RATE_LIMITED: 1,
-        DLQ_AUTH_ERROR: 1,
-      });
-      assert.equal(bundle.entries.length, 2);
-      assert.equal(bundle.entries[0].reasonCode, "DLQ_RATE_LIMITED");
-      assert.equal(bundle.entries[1].reasonCode, "DLQ_AUTH_ERROR");
-      assert.equal(bundle.entries[0].text, undefined);
-      assert.equal(bundle.entries[0].lastError, undefined);
-      assert.ok(bundle.entries[0].textBytes > 0);
-    },
-    [
-      {
-        ledger: 201,
-        source: "market",
-        text: `${RAW_BODY} to ${RAW_CHAT_ID}`,
-        error: `429 Too Many Requests for chat ${RAW_CHAT_ID} bot${BOT_TOKEN}`,
-      },
-      {
-        ledger: 202,
-        source: "squad",
-        text: `${RAW_BODY} to ${RAW_CHANNEL}`,
-        error: `403 Forbidden: bot was blocked by ${RAW_CHANNEL}`,
-      },
-    ],
-  );
+      assert.equal(exitCode, DLQ_EXIT_CODES.MALFORMED_FILE);
+      assert.equal(io.stdout.length, 0, "stdout must remain empty on error");
+      assert.match(io.stderr.join("\n"), /malformed/);
+    }
+  });
 });
 
-test("bundle on an empty or missing queue exports empty metadata cleanly", async () => {
+test("access failure (e.g. EISDIR) exits with code 4 and keeps stdout empty", async () => {
+  await withTempDlq(async ({ directory }) => {
+    const io = captureIo();
+    const { exitCode } = await runDlqCli({
+      argv: ["list", "--file", directory, "--json"],
+      stdout: io.out,
+      stderr: io.err,
+    });
+
+    assert.equal(exitCode, DLQ_EXIT_CODES.ACCESS_ERROR);
+    assert.equal(io.stdout.length, 0, "stdout must remain empty on access failure");
+    assert.match(io.stderr.join("\n"), /cannot read dead-letter file/);
+  });
+});
+
+test("subprocess --json stdout is pure JSON without load logs, and exits 3/4 on failures", async () => {
+  await withTempDlq(
+    async ({ directory, filePath }) => {
+      const { stdout, stderr } = await execFileAsync(process.execPath, [
+        CLI_PATH,
+        "list",
+        "--file",
+        filePath,
+        "--json",
+      ]);
+      assert.equal(stderr.includes("[dlq]"), false);
+      const parsed = JSON.parse(stdout);
+      assert.equal(parsed.depth, 1);
+
+      await writeFile(filePath, "{broken", "utf8");
+      await assert.rejects(
+        () => execFileAsync(process.execPath, [CLI_PATH, "list", "--file", filePath, "--json"]),
+        (err) => err.code === 3 && err.stdout === "" && /malformed/.test(err.stderr),
+      );
+
+      await assert.rejects(
+        () => execFileAsync(process.execPath, [CLI_PATH, "list", "--file", directory, "--json"]),
+        (err) => err.code === 4 && err.stdout === "" && /cannot read/.test(err.stderr),
+      );
+    },
+    [{ ledger: 88 }],
+  );
+});
+test("list and show surface stored networkPassphrase and purge --yes can still remove entries", async () => {
   await withTempDlq(async ({ filePath }) => {
-    const bundle = await exportDeadLetterBundle({ filePath });
-    assert.equal(bundle.schemaVersion, 1);
-    assert.equal(bundle.queue.depth, 0);
-    assert.deepEqual(bundle.queue.byReasonCode, {});
-    assert.deepEqual(bundle.entries, []);
-    assert.equal(classifyReasonCode("ETIMEDOUT"), "DLQ_TIMEOUT");
-    assert.equal(classifyReasonCode(null), "DLQ_UNKNOWN");
+    const queue = createDeadLetterQueue({
+      filePath,
+      maxEntries: 10,
+      maxAttempts: 5,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      now: () => 1_700_000_000_000,
+    });
+    await queue.load();
+    const entry = await queue.enqueue({
+      source: "market",
+      ledger: 90,
+      eventName: "claim_created",
+      text: "cross-network entry",
+      error: "Telegram 429",
+    });
+
+    const listIo = captureIo();
+    const listRes = await runDlqCli({
+      argv: ["list", "--file", filePath],
+      stdout: listIo.out,
+      stderr: listIo.err,
+    });
+    assert.equal(listRes.exitCode, 0);
+    assert.match(listIo.stdout.join("\n"), /network=Test SDF Network ; September 2015/);
+
+    const showIo = captureIo();
+    const showRes = await runDlqCli({
+      argv: ["show", entry.id, "--file", filePath],
+      stdout: showIo.out,
+      stderr: showIo.err,
+    });
+    assert.equal(showRes.exitCode, 0);
+    assert.match(showIo.stdout.join("\n"), /network:\s+Test SDF Network ; September 2015/);
+
+    const purgeRes = await purgeDeadLetters({ filePath, yes: true });
+    assert.equal(purgeRes.purged, 1);
+    assert.equal(purgeRes.remaining, 0);
   });
 });
