@@ -18,7 +18,7 @@ import { promisify } from "node:util";
 
 import { classifyDeadLetterReason, createDeadLetterQueue } from "../dist/deadLetter.js";
 import {
-  getDeadLetterStatus,
+  DLQ_EXIT_CODES,
   listDeadLetters,
   parseDurationMs,
   purgeDeadLetters,
@@ -383,83 +383,107 @@ test("parseDurationMs supports ms, s, m, h, d, w and compound durations", () => 
   assert.throws(() => parseDurationMs("abc"), /invalid --older-than/);
 });
 
-// ── status subcommand ─────────────────────────────────────────────────────────
+// ── Stable exit codes & machine-readable stdout ───────────────────────────────
 
-test("status reports counts and reason categories without raw message text or destinations", async () => {
-  const RAW_BODY = "RAW-NOTIFICATION-BODY-12345";
-  await withTempDlq(
-    async ({ filePath }) => {
+test("malformed JSON and invalid schema exit with code 3 and keep stdout empty", async () => {
+  await withTempDlq(async ({ filePath }) => {
+    for (const badBody of ["{not-json", JSON.stringify({ version: 2, entries: [] }), JSON.stringify({ version: 1, entries: [{}] })]) {
+      await writeFile(filePath, badBody, "utf8");
       const io = captureIo();
       const { exitCode } = await runDlqCli({
-        argv: ["status", "--file", filePath],
+        argv: ["list", "--file", filePath, "--json"],
         stdout: io.out,
         stderr: io.err,
       });
 
-      assert.equal(exitCode, 0);
-      assert.equal(io.stderr.length, 0);
-      const output = io.stdout.join("\n");
-      assert.match(output, /depth=3/);
-      assert.match(output, /rate_limited=2/);
-      assert.match(output, /network=1/);
-      assert.equal(output.includes(RAW_BODY), false, "raw message text must not appear in status");
-      assert.equal(output.includes(RAW_CHAT_ID), false, "raw chat id must not appear in status");
-      assert.equal(output.includes(BOT_TOKEN), false, "bot token must not appear in status");
-
-      const jsonIo = captureIo();
-      const jsonRes = await runDlqCli({
-        argv: ["status", "--file", filePath, "--json"],
-        stdout: jsonIo.out,
-        stderr: jsonIo.err,
-      });
-      assert.equal(jsonRes.exitCode, 0);
-      const jsonRaw = jsonIo.stdout.join("\n");
-      assert.equal(jsonRaw.includes(RAW_BODY), false);
-      assert.equal(jsonRaw.includes(RAW_CHAT_ID), false);
-      assert.equal(jsonRaw.includes(BOT_TOKEN), false);
-      const parsed = JSON.parse(jsonRaw);
-      assert.equal(parsed.depth, 3);
-      assert.deepEqual(parsed.bySource, { market: 2, squad: 1 });
-      assert.deepEqual(parsed.byReason, { rate_limited: 2, network: 1 });
-      assert.equal(parsed.maxAttemptsSeen, 1);
-
-      const summary = await getDeadLetterStatus({ filePath });
-      assert.equal(summary.depth, 3);
-    },
-    [
-      {
-        ledger: 101,
-        source: "market",
-        text: `${RAW_BODY} for ${RAW_CHAT_ID}`,
-        error: `Telegram 429 Too Many Requests for chat ${RAW_CHAT_ID} bot${BOT_TOKEN}`,
-      },
-      {
-        ledger: 102,
-        source: "market",
-        text: `${RAW_BODY} second`,
-        error: "429 retry after 5",
-      },
-      {
-        ledger: 103,
-        source: "squad",
-        text: `${RAW_BODY} third`,
-        error: "ECONNREFUSED 127.0.0.1:443",
-      },
-    ],
-  );
+      assert.equal(exitCode, DLQ_EXIT_CODES.MALFORMED_FILE);
+      assert.equal(io.stdout.length, 0, "stdout must remain empty on error");
+      assert.match(io.stderr.join("\n"), /malformed/);
+    }
+  });
 });
 
-test("status on an empty or missing queue reports depth=0", async () => {
-  await withTempDlq(async ({ filePath }) => {
+test("access failure (e.g. EISDIR) exits with code 4 and keeps stdout empty", async () => {
+  await withTempDlq(async ({ directory }) => {
     const io = captureIo();
     const { exitCode } = await runDlqCli({
-      argv: ["status", "--file", filePath],
+      argv: ["list", "--file", directory, "--json"],
       stdout: io.out,
       stderr: io.err,
     });
-    assert.equal(exitCode, 0);
-    assert.match(io.stdout.join("\n"), /depth=0/);
-    assert.equal(classifyDeadLetterReason(null), "unknown");
-    assert.equal(classifyDeadLetterReason("503 Service Unavailable"), "server_error");
+
+    assert.equal(exitCode, DLQ_EXIT_CODES.ACCESS_ERROR);
+    assert.equal(io.stdout.length, 0, "stdout must remain empty on access failure");
+    assert.match(io.stderr.join("\n"), /cannot read dead-letter file/);
+  });
+});
+
+test("subprocess --json stdout is pure JSON without load logs, and exits 3/4 on failures", async () => {
+  await withTempDlq(
+    async ({ directory, filePath }) => {
+      const { stdout, stderr } = await execFileAsync(process.execPath, [
+        CLI_PATH,
+        "list",
+        "--file",
+        filePath,
+        "--json",
+      ]);
+      assert.equal(stderr.includes("[dlq]"), false);
+      const parsed = JSON.parse(stdout);
+      assert.equal(parsed.depth, 1);
+
+      await writeFile(filePath, "{broken", "utf8");
+      await assert.rejects(
+        () => execFileAsync(process.execPath, [CLI_PATH, "list", "--file", filePath, "--json"]),
+        (err) => err.code === 3 && err.stdout === "" && /malformed/.test(err.stderr),
+      );
+
+      await assert.rejects(
+        () => execFileAsync(process.execPath, [CLI_PATH, "list", "--file", directory, "--json"]),
+        (err) => err.code === 4 && err.stdout === "" && /cannot read/.test(err.stderr),
+      );
+    },
+    [{ ledger: 88 }],
+  );
+});
+test("list and show surface stored networkPassphrase and purge --yes can still remove entries", async () => {
+  await withTempDlq(async ({ filePath }) => {
+    const queue = createDeadLetterQueue({
+      filePath,
+      maxEntries: 10,
+      maxAttempts: 5,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      now: () => 1_700_000_000_000,
+    });
+    await queue.load();
+    const entry = await queue.enqueue({
+      source: "market",
+      ledger: 90,
+      eventName: "claim_created",
+      text: "cross-network entry",
+      error: "Telegram 429",
+    });
+
+    const listIo = captureIo();
+    const listRes = await runDlqCli({
+      argv: ["list", "--file", filePath],
+      stdout: listIo.out,
+      stderr: listIo.err,
+    });
+    assert.equal(listRes.exitCode, 0);
+    assert.match(listIo.stdout.join("\n"), /network=Test SDF Network ; September 2015/);
+
+    const showIo = captureIo();
+    const showRes = await runDlqCli({
+      argv: ["show", entry.id, "--file", filePath],
+      stdout: showIo.out,
+      stderr: showIo.err,
+    });
+    assert.equal(showRes.exitCode, 0);
+    assert.match(showIo.stdout.join("\n"), /network:\s+Test SDF Network ; September 2015/);
+
+    const purgeRes = await purgeDeadLetters({ filePath, yes: true });
+    assert.equal(purgeRes.purged, 1);
+    assert.equal(purgeRes.remaining, 0);
   });
 });
