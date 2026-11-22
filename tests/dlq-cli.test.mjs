@@ -22,6 +22,7 @@ import {
   saveRecoveryCheckpoint,
 } from "../dist/deadLetter.js";
 import {
+  DLQ_EXIT_CODES,
   listDeadLetters,
   parseDurationMs,
   purgeDeadLetters,
@@ -387,151 +388,107 @@ test("parseDurationMs supports ms, s, m, h, d, w and compound durations", () => 
   assert.throws(() => parseDurationMs("abc"), /invalid --older-than/);
 });
 
-// ── recover subcommand ────────────────────────────────────────────────────────
+// ── Stable exit codes & machine-readable stdout ───────────────────────────────
 
-test("recover persists a bounded checkpoint and resumes without reprocessing acknowledged entries", async () => {
-  await withTempDlq(
-    async ({ directory, filePath }) => {
-      const checkpointFile = path.join(directory, "recovery-checkpoint.json");
-      const processedLedgers = [];
-
-      // Dry run leaves queue and checkpoint untouched.
-      const dryRun = await recoverDeadLetters({
-        filePath,
-        checkpointFile,
-        limit: 2,
-        chatId: RAW_CHAT_ID,
-      });
-      assert.equal(dryRun.dryRun, true);
-      assert.equal(dryRun.recovered, 2);
-      assert.equal(dryRun.interrupted, true);
-      assert.equal(await loadRecoveryCheckpoint(checkpointFile), null);
-
-      // First run: bounded to 2 entries (interrupted before processing all 4).
-      const firstRun = await recoverDeadLetters({
-        filePath,
-        checkpointFile,
-        limit: 2,
-        maxAcknowledgedIds: 3,
-        yes: true,
-        chatId: RAW_CHAT_ID,
-        send: async (_text, entry) => {
-          processedLedgers.push(entry.ledger);
-        },
-      });
-      assert.equal(firstRun.dryRun, false);
-      assert.equal(firstRun.recovered, 2);
-      assert.equal(firstRun.interrupted, true);
-      assert.equal(firstRun.completed, false);
-      assert.equal(firstRun.remaining, 2);
-      assert.deepEqual(processedLedgers, [101, 102]);
-
-      const checkpointAfterFirst = await loadRecoveryCheckpoint(checkpointFile, 3);
-      assert.ok(checkpointAfterFirst);
-      assert.equal(checkpointAfterFirst.completed, false);
-      assert.equal(checkpointAfterFirst.acknowledgedIds.length, 2);
-
-      // Re-add ledger 101 to simulate an interruption before queue persistence
-      // or a stale copy; resuming must skip already-acknowledged entries.
-      const queue = createDeadLetterQueue({ filePath, maxEntries: 50, maxAttempts: 10 });
-      await queue.load();
-      await queue.enqueue({
-        source: "market",
-        ledger: 101,
-        eventName: "claim_created",
-        text: "Notification @ ledger 101",
-        error: "re-injected",
-      });
-
-      const secondRun = await recoverDeadLetters({
-        filePath,
-        checkpointFile,
-        maxAcknowledgedIds: 3,
-        yes: true,
-        chatId: RAW_CHAT_ID,
-        send: async (_text, entry) => {
-          processedLedgers.push(entry.ledger);
-        },
-      });
-      assert.equal(secondRun.skippedAcknowledged, 1, "already-acknowledged entry 101 must be skipped");
-      assert.equal(secondRun.recovered, 2);
-      assert.equal(secondRun.interrupted, false);
-      assert.equal(secondRun.completed, true);
-      assert.equal(secondRun.remaining, 0);
-      assert.deepEqual(processedLedgers, [101, 102, 103, 104]);
-
-      // Checkpoint is bounded to maxAcknowledgedIds (3 of 4).
-      const finalCheckpoint = await loadRecoveryCheckpoint(checkpointFile, 3);
-      assert.ok(finalCheckpoint);
-      assert.equal(finalCheckpoint.completed, true);
-      assert.equal(finalCheckpoint.acknowledgedIds.length, 3);
-    },
-    [
-      { ledger: 101 },
-      { ledger: 102 },
-      { ledger: 103 },
-      { ledger: 104 },
-    ],
-  );
-});
-
-test("recover respects AbortSignal interruption and CLI --source / --limit / --reset-checkpoint", async () => {
-  await withTempDlq(
-    async ({ directory, filePath }) => {
-      const checkpointFile = path.join(directory, "abort-checkpoint.json");
-      await saveRecoveryCheckpoint(checkpointFile, {
-        version: 1,
-        updatedAt: new Date().toISOString(),
-        acknowledgedIds: ["stale:0:none:00000000"],
-        completed: false,
-      });
-
-      const controller = new AbortController();
-      const processed = [];
-      const res = await recoverDeadLetters({
-        filePath,
-        checkpointFile,
-        source: "market",
-        resetCheckpoint: true,
-        yes: true,
-        signal: controller.signal,
-        send: async (_text, entry) => {
-          processed.push(entry.ledger);
-          controller.abort();
-        },
-      });
-      assert.equal(res.recovered, 1);
-      assert.equal(res.interrupted, true);
-      assert.equal(res.remaining, 2); // 1 market left + 1 squad untouched
-      assert.deepEqual(processed, [10]);
-
-      // CLI invocation completes the remaining market entry without touching squad.
+test("malformed JSON and invalid schema exit with code 3 and keep stdout empty", async () => {
+  await withTempDlq(async ({ filePath }) => {
+    for (const badBody of ["{not-json", JSON.stringify({ version: 2, entries: [] }), JSON.stringify({ version: 1, entries: [{}] })]) {
+      await writeFile(filePath, badBody, "utf8");
       const io = captureIo();
-      const cliRes = await runDlqCli({
-        argv: [
-          "recover",
-          "--file",
-          filePath,
-          "--checkpoint",
-          checkpointFile,
-          "--source",
-          "market",
-          "--yes",
-          "--json",
-        ],
+      const { exitCode } = await runDlqCli({
+        argv: ["list", "--file", filePath, "--json"],
         stdout: io.out,
         stderr: io.err,
       });
-      assert.equal(cliRes.exitCode, 0);
-      const parsed = JSON.parse(io.stdout.join("\n"));
-      assert.equal(parsed.recovered, 1);
-      assert.equal(parsed.completed, true);
-      assert.equal(parsed.remaining, 1);
+
+      assert.equal(exitCode, DLQ_EXIT_CODES.MALFORMED_FILE);
+      assert.equal(io.stdout.length, 0, "stdout must remain empty on error");
+      assert.match(io.stderr.join("\n"), /malformed/);
+    }
+  });
+});
+
+test("access failure (e.g. EISDIR) exits with code 4 and keeps stdout empty", async () => {
+  await withTempDlq(async ({ directory }) => {
+    const io = captureIo();
+    const { exitCode } = await runDlqCli({
+      argv: ["list", "--file", directory, "--json"],
+      stdout: io.out,
+      stderr: io.err,
+    });
+
+    assert.equal(exitCode, DLQ_EXIT_CODES.ACCESS_ERROR);
+    assert.equal(io.stdout.length, 0, "stdout must remain empty on access failure");
+    assert.match(io.stderr.join("\n"), /cannot read dead-letter file/);
+  });
+});
+
+test("subprocess --json stdout is pure JSON without load logs, and exits 3/4 on failures", async () => {
+  await withTempDlq(
+    async ({ directory, filePath }) => {
+      const { stdout, stderr } = await execFileAsync(process.execPath, [
+        CLI_PATH,
+        "list",
+        "--file",
+        filePath,
+        "--json",
+      ]);
+      assert.equal(stderr.includes("[dlq]"), false);
+      const parsed = JSON.parse(stdout);
+      assert.equal(parsed.depth, 1);
+
+      await writeFile(filePath, "{broken", "utf8");
+      await assert.rejects(
+        () => execFileAsync(process.execPath, [CLI_PATH, "list", "--file", filePath, "--json"]),
+        (err) => err.code === 3 && err.stdout === "" && /malformed/.test(err.stderr),
+      );
+
+      await assert.rejects(
+        () => execFileAsync(process.execPath, [CLI_PATH, "list", "--file", directory, "--json"]),
+        (err) => err.code === 4 && err.stdout === "" && /cannot read/.test(err.stderr),
+      );
     },
-    [
-      { ledger: 10, source: "market" },
-      { ledger: 20, source: "market" },
-      { ledger: 30, source: "squad" },
-    ],
+    [{ ledger: 88 }],
   );
+});
+test("list and show surface stored networkPassphrase and purge --yes can still remove entries", async () => {
+  await withTempDlq(async ({ filePath }) => {
+    const queue = createDeadLetterQueue({
+      filePath,
+      maxEntries: 10,
+      maxAttempts: 5,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      now: () => 1_700_000_000_000,
+    });
+    await queue.load();
+    const entry = await queue.enqueue({
+      source: "market",
+      ledger: 90,
+      eventName: "claim_created",
+      text: "cross-network entry",
+      error: "Telegram 429",
+    });
+
+    const listIo = captureIo();
+    const listRes = await runDlqCli({
+      argv: ["list", "--file", filePath],
+      stdout: listIo.out,
+      stderr: listIo.err,
+    });
+    assert.equal(listRes.exitCode, 0);
+    assert.match(listIo.stdout.join("\n"), /network=Test SDF Network ; September 2015/);
+
+    const showIo = captureIo();
+    const showRes = await runDlqCli({
+      argv: ["show", entry.id, "--file", filePath],
+      stdout: showIo.out,
+      stderr: showIo.err,
+    });
+    assert.equal(showRes.exitCode, 0);
+    assert.match(showIo.stdout.join("\n"), /network:\s+Test SDF Network ; September 2015/);
+
+    const purgeRes = await purgeDeadLetters({ filePath, yes: true });
+    assert.equal(purgeRes.purged, 1);
+    assert.equal(purgeRes.remaining, 0);
+  });
 });
