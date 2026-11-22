@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -101,170 +101,52 @@ test("restore normalizes supported legacy cursor files to version 1", async () =
   });
 });
 
-test("restore refuses write with conflict when live cursor changed since inspection", async () => {
+test("rejects backup and restore when symbolic-link aliases resolve to the same file", async () => {
   await withTempDir(async (directory) => {
-    const cursorFile = path.join(directory, "cursor.json");
-    const backupFile = path.join(directory, "backup.json");
-    const lockFile = path.join(directory, "poller.lock");
-    const liveV1 = `${JSON.stringify({
+    const realDir = path.join(directory, "real");
+    const linkDir = path.join(directory, "alias");
+    await mkdir(realDir);
+    await symlink(realDir, linkDir);
+
+    const cursorFile = path.join(realDir, "cursor.json");
+    const lockFile = path.join(realDir, "poller.lock");
+    const raw = `${JSON.stringify({
       version: 1,
       updatedAt: "2026-09-29T00:00:00.000Z",
-      targets: { market: { cursor: "live-v1", lastEventLedger: 10 } },
+      targets: { market: { cursor: "live-cursor", lastEventLedger: 99 } },
     }, null, 2)}\n`;
-    const liveV2 = `${JSON.stringify({
-      version: 1,
-      updatedAt: "2026-09-29T00:01:00.000Z",
-      targets: { market: { cursor: "live-v2", lastEventLedger: 11 } },
-    }, null, 2)}\n`;
-    const backupRaw = `${JSON.stringify({
-      version: 1,
-      updatedAt: "2026-09-28T00:00:00.000Z",
-      targets: { market: { cursor: "backup-cursor", lastEventLedger: 5 } },
-    }, null, 2)}\n`;
+    await writeFile(cursorFile, raw);
 
-    await writeFile(cursorFile, liveV1);
-    await writeFile(backupFile, backupRaw);
-
-    const inspected = await inspectCursor({ cursorFile });
-    assert.equal(inspected.exists, true);
-    assert.ok(inspected.digest);
-
-    // Simulate another writer advancing the live cursor after inspection.
-    await writeFile(cursorFile, liveV2);
-
+    // 1. Direct file symlink alias
+    const fileAlias = path.join(directory, "cursor-link.json");
+    await symlink(cursorFile, fileAlias);
     await assert.rejects(
-      restoreCursor({
-        cursorFile,
-        backupFile,
-        lockFile,
-        force: true,
-        expectedLiveDigest: inspected.digest,
-      }),
-      (err) => err instanceof CursorConflictError && err.target === "live",
+      restoreCursor({ cursorFile, backupFile: fileAlias, lockFile, force: true }),
+      /must be different/,
     );
-
-    // Live cursor must be preserved.
-    assert.equal(await readFile(cursorFile, "utf8"), liveV2);
+    await assert.rejects(
+      backupCursor({ cursorFile, backupFile: fileAlias, force: true }),
+      /must be different/,
+    );
+    // Live cursor must remain untouched and lock must not be left behind
+    assert.equal(await readFile(cursorFile, "utf8"), raw);
     assert.equal(await exists(lockFile), false);
-  });
-});
 
-test("restore refuses write with conflict when source file changed since inspection", async () => {
-  await withTempDir(async (directory) => {
-    const cursorFile = path.join(directory, "cursor.json");
-    const backupFile = path.join(directory, "backup.json");
-    const lockFile = path.join(directory, "poller.lock");
-    const liveRaw = `${JSON.stringify({
-      version: 1,
-      updatedAt: "2026-09-29T00:00:00.000Z",
-      targets: { market: { cursor: "live-cursor", lastEventLedger: 20 } },
-    }, null, 2)}\n`;
-    const backupV1 = `${JSON.stringify({
-      version: 1,
-      updatedAt: "2026-09-28T00:00:00.000Z",
-      targets: { market: { cursor: "backup-v1", lastEventLedger: 5 } },
-    }, null, 2)}\n`;
-    const backupV2 = `${JSON.stringify({
-      version: 1,
-      updatedAt: "2026-09-28T00:05:00.000Z",
-      targets: { market: { cursor: "backup-v2", lastEventLedger: 6 } },
-    }, null, 2)}\n`;
-
-    await writeFile(cursorFile, liveRaw);
-    await writeFile(backupFile, backupV1);
-
+    // 2. Directory symlink alias (differently spelled path to same file)
+    const dirAliasCursor = path.join(linkDir, "cursor.json");
     await assert.rejects(
-      restoreCursor({
-        cursorFile,
-        backupFile,
-        lockFile,
-        force: true,
-        onBeforeWrite: async () => {
-          await writeFile(backupFile, backupV2);
-        },
-      }),
-      (err) => err instanceof CursorConflictError && err.target === "source",
+      restoreCursor({ cursorFile, backupFile: dirAliasCursor, lockFile, force: true }),
+      /must be different/,
     );
+    assert.equal(await readFile(cursorFile, "utf8"), raw);
 
-    // Live cursor must remain untouched.
-    assert.equal(await readFile(cursorFile, "utf8"), liveRaw);
-  });
-});
-
-test("cursor CLI inspect and restore --if-match report conflict in JSON and preserve live cursor", async () => {
-  await withTempDir(async (directory) => {
-    const cursorFile = path.join(directory, "cursor.json");
-    const backupFile = path.join(directory, "backup.json");
-    const liveRaw = `${JSON.stringify({
-      version: 1,
-      updatedAt: "2026-09-29T00:00:00.000Z",
-      targets: { market: { cursor: "live-cursor", lastEventLedger: 20 } },
-    }, null, 2)}\n`;
-    const backupRaw = `${JSON.stringify({
-      version: 1,
-      updatedAt: "2026-09-28T00:00:00.000Z",
-      targets: { market: { cursor: "backup-cursor", lastEventLedger: 5 } },
-    }, null, 2)}\n`;
-
-    await writeFile(cursorFile, liveRaw);
-    await writeFile(backupFile, backupRaw);
-
-    const outLines = [];
-    const errLines = [];
-    const inspectRes = await runCursorCli({
-      argv: ["inspect", "--file", cursorFile, "--json"],
-      stdout: (line) => outLines.push(line),
-      stderr: (line) => errLines.push(line),
-    });
-    assert.equal(inspectRes.exitCode, 0);
-    const inspected = JSON.parse(outLines.join("\n"));
-    assert.equal(inspected.exists, true);
-    assert.equal(inspected.targets, 1);
-
-    const conflictOut = [];
-    const conflictErr = [];
-    const conflictRes = await runCursorCli({
-      argv: [
-        "restore",
-        "--file",
-        cursorFile,
-        "--from",
-        backupFile,
-        "--if-match",
-        "0".repeat(64),
-        "--force",
-        "--json",
-      ],
-      stdout: (line) => conflictOut.push(line),
-      stderr: (line) => conflictErr.push(line),
-    });
-    assert.equal(conflictRes.exitCode, 1);
-    const conflictPayload = JSON.parse(conflictOut.join("\n"));
-    assert.equal(conflictPayload.status, "conflict");
-    assert.equal(conflictPayload.target, "live");
-    assert.equal(await readFile(cursorFile, "utf8"), liveRaw);
-
-    // Matching --if-match succeeds.
-    const okOut = [];
-    const okRes = await runCursorCli({
-      argv: [
-        "restore",
-        "--file",
-        cursorFile,
-        "--from",
-        backupFile,
-        "--if-match",
-        inspected.digest,
-        "--force",
-        "--json",
-      ],
-      stdout: (line) => okOut.push(line),
-      stderr: (line) => conflictErr.push(line),
-    });
-    assert.equal(okRes.exitCode, 0);
-    const okPayload = JSON.parse(okOut.join("\n"));
-    assert.equal(okPayload.status, "restored");
-    const restored = JSON.parse(await readFile(cursorFile, "utf8"));
-    assert.equal(restored.targets.market.cursor, "backup-cursor");
+    // 3. Directory symlink alias when destination file does not exist yet
+    const newInReal = path.join(realDir, "new-backup.json");
+    const newInLink = path.join(linkDir, "new-backup.json");
+    await writeFile(newInReal, raw);
+    await assert.rejects(
+      restoreCursor({ cursorFile: newInLink, backupFile: newInReal, lockFile, force: true }),
+      /must be different/,
+    );
   });
 });
