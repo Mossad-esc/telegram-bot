@@ -26,6 +26,7 @@
  *   - 4: dead-letter file access or I/O failure
  */
 
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
@@ -39,6 +40,7 @@ import {
   DeadLetterAccessError,
   DeadLetterMalformedError,
   type DeadLetterEntry,
+  type DeadLetterIncidentBundle,
 } from "./deadLetter.js";
 import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
@@ -93,6 +95,10 @@ export interface PurgeDlqOptions extends ListDlqOptions {
   olderThan?: string | number;
   olderThanMs?: number;
   yes?: boolean;
+}
+
+export interface ExportBundleOptions extends ListDlqOptions {
+  outFile?: string;
 }
 
 export interface PurgeDlqResult {
@@ -521,6 +527,7 @@ export async function recoverDeadLetters(
 interface ParsedCliArgs {
   subcommand: "list" | "show" | "purge" | "recover";
   file?: string;
+  out?: string;
   id?: string;
   olderThan?: string;
   checkpoint?: string;
