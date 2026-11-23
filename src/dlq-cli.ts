@@ -26,12 +26,15 @@
  *   - 4: dead-letter file access or I/O failure
  */
 
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
 
 import {
+  clearRecoveryCheckpoint,
   createDeadLetterQueue,
+  DEAD_LETTER_CHECKPOINT_MAX_IDS,
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
   DeadLetterAccessError,
@@ -94,12 +97,39 @@ export interface PurgeDlqOptions extends ListDlqOptions {
   yes?: boolean;
 }
 
+export interface ExportBundleOptions extends ListDlqOptions {
+  outFile?: string;
+}
+
 export interface PurgeDlqResult {
   dryRun: boolean;
   purged: number;
   remaining: number;
   purgedIds: string[];
   entries: DlqEntryView[];
+  chatId: string;
+}
+
+export interface RecoverDlqOptions extends ListDlqOptions {
+  checkpointFile?: string;
+  source?: string;
+  limit?: number;
+  maxAcknowledgedIds?: number;
+  resetCheckpoint?: boolean;
+  yes?: boolean;
+  signal?: AbortSignal;
+  send?: (text: string, entry: DeadLetterEntry) => Promise<void>;
+}
+
+export interface RecoverDlqResult {
+  dryRun: boolean;
+  checkpointFile: string;
+  recovered: number;
+  skippedAcknowledged: number;
+  remaining: number;
+  interrupted: boolean;
+  completed: boolean;
+  acknowledgedCount: number;
   chatId: string;
 }
 
@@ -430,11 +460,89 @@ async function persistPurgedQueue(
   }, budget);
 }
 
+/**
+ * Interruptible, resumable dead-letter recovery.
+ *
+ * Without `yes: true`, performs a dry run inspecting the queue and checkpoint
+ * without modifying disk. With `yes: true`, processes unacknowledged entries
+ * up to `limit` (or until interrupted) and persists a bounded checkpoint so a
+ * resumed run never reprocesses already-acknowledged entries.
+ */
+export async function recoverDeadLetters(
+  options: RecoverDlqOptions,
+): Promise<RecoverDlqResult> {
+  const checkpointFile = options.checkpointFile ?? `${options.filePath}.recovery.json`;
+  const maxAcknowledgedIds = options.maxAcknowledgedIds ?? DEAD_LETTER_CHECKPOINT_MAX_IDS;
+  const dryRun = options.yes !== true;
+
+  if (options.limit !== undefined && (!Number.isInteger(options.limit) || options.limit < 1)) {
+    throw new DlqUsageError(`--limit must be a positive integer`);
+  }
+
+  const queue = openQueue(options);
+  await queue.load();
+  const snapshot = queue.snapshot();
+
+  if (dryRun) {
+    const checkpoint = options.resetCheckpoint
+      ? null
+      : await loadRecoveryCheckpoint(checkpointFile, maxAcknowledgedIds);
+    const ackSet = new Set(checkpoint?.acknowledgedIds ?? []);
+    const skippedAcknowledged = snapshot.filter((e) => ackSet.has(e.id)).length;
+    const eligible = snapshot.filter(
+      (e) => !ackSet.has(e.id) && (!options.source || e.source === options.source),
+    );
+    const wouldProcess =
+      options.limit !== undefined ? Math.min(eligible.length, options.limit) : eligible.length;
+    return {
+      dryRun: true,
+      checkpointFile,
+      recovered: wouldProcess,
+      skippedAcknowledged,
+      remaining: snapshot.length - skippedAcknowledged - wouldProcess,
+      interrupted: options.limit !== undefined && eligible.length > options.limit,
+      completed: eligible.length <= (options.limit ?? eligible.length),
+      acknowledgedCount: ackSet.size,
+      chatId: resolveChatIdForSource(options.source ?? "default", options.chatId),
+    };
+  }
+
+  if (options.resetCheckpoint) {
+    await clearRecoveryCheckpoint(checkpointFile);
+  }
+
+  const send = options.send ?? (async () => undefined);
+  const res = await queue.recoverSelection(send, {
+    checkpointFile,
+    source: options.source,
+    budget: options.limit,
+    maxAcknowledgedIds,
+    signal: options.signal,
+  });
+
+  return {
+    dryRun: false,
+    checkpointFile,
+    recovered: res.sent,
+    skippedAcknowledged: res.skippedAcknowledged,
+    remaining: res.remaining,
+    interrupted: res.interrupted,
+    completed: res.completed,
+    acknowledgedCount: res.acknowledgedCount,
+    chatId: resolveChatIdForSource(options.source ?? "default", options.chatId),
+  };
+}
+
 interface ParsedCliArgs {
   subcommand: "status" | "list" | "show" | "purge";
   file?: string;
+  out?: string;
   id?: string;
   olderThan?: string;
+  checkpoint?: string;
+  source?: string;
+  limit?: number;
+  resetCheckpoint: boolean;
   yes: boolean;
   json: boolean;
   chatId?: string;
@@ -453,6 +561,7 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
 
   const parsed: ParsedCliArgs = {
     subcommand,
+    resetCheckpoint: false,
     yes: false,
     json: false,
   };
@@ -462,12 +571,22 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
     const arg = rest[i]!;
 
     if (arg === "--yes") {
-      if (subcommand !== "purge") {
-        throw new DlqUsageError(`--yes is only valid with purge\n${USAGE}`);
+      if (subcommand !== "purge" && subcommand !== "recover") {
+        throw new DlqUsageError(`--yes is only valid with purge or recover\n${USAGE}`);
       }
       if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
       seen.add(arg);
       parsed.yes = true;
+      continue;
+    }
+
+    if (arg === "--reset-checkpoint") {
+      if (subcommand !== "recover") {
+        throw new DlqUsageError(`--reset-checkpoint is only valid with recover\n${USAGE}`);
+      }
+      if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
+      seen.add(arg);
+      parsed.resetCheckpoint = true;
       continue;
     }
 
@@ -478,9 +597,22 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       continue;
     }
 
-    if (arg === "--file" || arg === "--older-than" || arg === "--chat-id") {
+    if (
+      arg === "--file" ||
+      arg === "--older-than" ||
+      arg === "--chat-id" ||
+      arg === "--checkpoint" ||
+      arg === "--source" ||
+      arg === "--limit"
+    ) {
       if (arg === "--older-than" && subcommand !== "purge") {
         throw new DlqUsageError(`--older-than is only valid with purge\n${USAGE}`);
+      }
+      if (
+        (arg === "--checkpoint" || arg === "--source" || arg === "--limit") &&
+        subcommand !== "recover"
+      ) {
+        throw new DlqUsageError(`${arg} is only valid with recover\n${USAGE}`);
       }
       if (seen.has(arg)) throw new DlqUsageError(`duplicate ${arg} option\n${USAGE}`);
       seen.add(arg);
@@ -491,6 +623,15 @@ export function parseDlqArgs(argv: string[]): ParsedCliArgs {
       if (arg === "--file") parsed.file = value;
       else if (arg === "--older-than") parsed.olderThan = value;
       else if (arg === "--chat-id") parsed.chatId = value;
+      else if (arg === "--checkpoint") parsed.checkpoint = value;
+      else if (arg === "--source") parsed.source = value;
+      else if (arg === "--limit") {
+        const limit = Number(value);
+        if (!Number.isInteger(limit) || limit < 1) {
+          throw new DlqUsageError(`--limit must be a positive integer\n${USAGE}`);
+        }
+        parsed.limit = limit;
+      }
       i += 1;
       continue;
     }
@@ -611,6 +752,28 @@ function formatPurgeOutput(
   );
 }
 
+function formatRecoverOutput(
+  result: RecoverDlqResult,
+  filePath: string,
+  asJson: boolean,
+): string {
+  if (asJson) {
+    return `${JSON.stringify({ file: filePath, ...result }, null, 2)}\n`;
+  }
+  if (result.dryRun) {
+    return (
+      `[dlq] dry-run: would recover ${result.recovered} entry(s), ` +
+      `skip ${result.skippedAcknowledged} acknowledged, ${result.remaining} remaining ` +
+      `(checkpoint=${result.checkpointFile}, chat=${result.chatId}); pass --yes to write`
+    );
+  }
+  return (
+    `[dlq] recovered ${result.recovered} entry(s), skipped ${result.skippedAcknowledged} acknowledged, ` +
+    `${result.remaining} remaining (interrupted=${result.interrupted}, completed=${result.completed}, ` +
+    `checkpoint=${result.checkpointFile}, chat=${result.chatId})`
+  );
+}
+
 export interface RunDlqCliOptions {
   argv?: string[];
   now?: () => number;
@@ -663,12 +826,25 @@ export async function runDlqCli(
       return { exitCode: 0 };
     }
 
-    const result = await purgeDeadLetters({
+    if (parsed.subcommand === "purge") {
+      const result = await purgeDeadLetters({
+        ...commonOptions,
+        olderThan: parsed.olderThan,
+        yes: parsed.yes,
+      });
+      out(formatPurgeOutput(result, filePath, parsed.json).trimEnd());
+      return { exitCode: 0 };
+    }
+
+    const result = await recoverDeadLetters({
       ...commonOptions,
-      olderThan: parsed.olderThan,
+      checkpointFile: parsed.checkpoint ? resolvePath(parsed.checkpoint) : undefined,
+      source: parsed.source,
+      limit: parsed.limit,
+      resetCheckpoint: parsed.resetCheckpoint,
       yes: parsed.yes,
     });
-    out(formatPurgeOutput(result, filePath, parsed.json).trimEnd());
+    out(formatRecoverOutput(result, filePath, parsed.json).trimEnd());
     return { exitCode: 0 };
   } catch (err) {
     if (err instanceof DlqUsageError) {

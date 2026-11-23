@@ -22,6 +22,7 @@ import {
   listDeadLetters,
   parseDurationMs,
   purgeDeadLetters,
+  recoverDeadLetters,
   runDlqCli,
   showDeadLetter,
   USAGE,
